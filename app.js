@@ -925,30 +925,7 @@ async function onFinish() {
 //HELPER LOADING OVERLAY DAN ALERT
 //--------------------------------
 
-//show loading
-function showLoading(text = "Memproses...") {
-  let overlay = document.getElementById("loading-overlay");
-  if (!overlay) {
-    overlay = document.createElement("div");
-    overlay.id = "loading-overlay";
-    overlay.innerHTML = `
-      <div class="loader-box">
-        <div class="spinner"></div>
-        <p id="loading-text">${text}</p>
-      </div>`;
-    document.body.appendChild(overlay);
-  } else {
-    document.getElementById("loading-text").textContent = text;
-  }
-  updateLoadingProgress();
-  overlay.style.display = "flex";
-}
 
-//hide loading
-function hideLoading() {
-  const overlay = document.getElementById("loading-overlay");
-  if (overlay) overlay.style.display = "none";
-}
 
 //Show Alert
 function showAlert(type, message, duration = 2500) {
@@ -1257,29 +1234,6 @@ async function parseMasterFile(file) {
 
   throw new Error("Format tidak didukung. Gunakan CSV atau XLS/XLSX.");
 }
-//helpermaster
-async function getAllMasterUPC() {
-  const store = tx(STORE_MASTER);
-  return new Promise((res, rej) => {
-    const req = store.getAllKeys();
-    req.onsuccess = () => res(new Set(req.result));
-    req.onerror = () => rej(req.error);
-  });
-}
-
-async function saveMasterBulk(list) {
-  return new Promise((resolve, reject) => {
-    const t = db.transaction([STORE_MASTER], "readwrite");
-    const store = t.objectStore(STORE_MASTER);
-
-    for (const item of list) {
-      store.put(item);
-    }
-
-    t.oncomplete = resolve;
-    t.onerror = () => reject(t.error);
-  });
-}
 
 function showLoading() {
   $('loadingOverlay').classList.remove('hidden');
@@ -1421,218 +1375,6 @@ function countQuotes(s) {
 /**
  * Main streaming import function (replace existing onFileMasterSelected)
  */
- //error
-async function fileMasterSelected(e) {
-  const file = e.target.files[0];
-  if (!file) return;
-
-  // only accept csv for streaming mode
-  const ext = (file.name.split('.').pop() || '').toLowerCase();
-  if (ext !== 'csv') {
-    showAlert('error', 'Untuk file besar, silakan convert Excel ke CSV terlebih dahulu (delimiter ;).');
-    $('fileMaster').value = '';
-    return;
-  }
-
-  showLoading('Memuat... 0%');
-
-  // configuration
-  const CHUNK_SIZE = 1024 * 1024; // 1 MB per slice
-  const BATCH_SIZE = 1000;        // simpan tiap 1000 record
-  const delimiter = ';';
-
-  let offset = 0;
-  const size = file.size;
-
-  // counters
-  let sukses = 0, duplicate = 0, gagal = 0;
-  let headerProcessed = false;
-  let upcIdx = -1, artIdx = -1, descIdx = -1, hargaIdx = -1;
-
-  // load existing UPC set
-  let existingUPC = new Set();
-  try {
-    existingUPC = await getAllMasterUPC();
-  } catch (err) {
-    console.error('Gagal ambil existing UPC', err);
-    existingUPC = new Set();
-  }
-
-  const buffer = [];
-  let carry = ""; // leftover partial line from previous chunk
-
-  try {
-    while (offset < size) {
-      const end = Math.min(offset + CHUNK_SIZE, size);
-      const blob = file.slice(offset, end);
-      const text = await blob.text(); // decode this chunk as text
-      offset = end;
-
-      // combine carry + chunk
-      let chunk = carry + text;
-
-      // Split into lines. Keep last partial line in carry.
-      // handle both \r\n and \n
-      const lines = chunk.split(/\r\n|\n/);
-      // if the original chunk did not end with newline, last element is partial
-      if (!/(\r\n|\n)$/.test(chunk)) {
-        carry = lines.pop();
-      } else {
-        carry = "";
-      }
-
-      // Because CSV fields can contain newlines inside quotes, we need to rejoin lines
-      // that have unmatched quotes. We'll process lines and merge when quote count is odd.
-      const processedLines = [];
-      let pending = "";
-      let pendingQuotes = 0;
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        if (pending === "") {
-          // start new
-          const q = countQuotes(line);
-          if (q % 2 === 1) {
-            // odd quotes -> open quoted field across lines
-            pending = line;
-            pendingQuotes = q;
-            continue;
-          } else {
-            processedLines.push(line);
-          }
-        } else {
-          // we have pending, append
-          pending += "\n" + line;
-          pendingQuotes += countQuotes(line);
-          if (pendingQuotes % 2 === 0) {
-            // closed now
-            processedLines.push(pending);
-            pending = "";
-            pendingQuotes = 0;
-          } else {
-            // still open, continue
-            continue;
-          }
-        }
-      }
-      // if pending still exists, keep it in carry to join with next chunk
-      if (pending !== "") {
-        carry = (carry ? carry + "\n" + pending : pending);
-      }
-
-      // process each processed line
-      for (let i = 0; i < processedLines.length; i++) {
-        const rawLine = processedLines[i].trim();
-        if (rawLine === "") continue;
-
-        // header detection
-        if (!headerProcessed) {
-          const headerFields = parseCsvLine(rawLine, delimiter).map(h => (h||'').toString().toLowerCase().trim());
-
-          upcIdx = headerFields.findIndex(h => h.includes("upc"));
-          artIdx = headerFields.findIndex(h => h.includes("article") || h.includes("artikel"));
-          descIdx = headerFields.findIndex(h => h.includes("deskripsi") || h.includes("description") || h.includes("desc"));
-          hargaIdx = headerFields.findIndex(h => h.includes("harga") || h.includes("price") || h.includes("cost"));
-
-          if (upcIdx === -1 || artIdx === -1 || descIdx === -1) {
-            hideLoading();
-            showAlert("error", "Header wajib: UPC, Article/Artikel, Deskripsi (dan optional Harga). Pastikan header ada dan menggunakan delimiter ;");
-            $('fileMaster').value = '';
-            return;
-          }
-
-          headerProcessed = true;
-          continue; // header consumed
-        }
-
-        // parse row
-        const cols = parseCsvLine(rawLine, delimiter);
-        const upc = (cols[upcIdx] || '').toString().trim();
-        const article = (cols[artIdx] || '').toString().trim();
-        const deskripsi = (cols[descIdx] || '').toString().trim();
-        const harga = (hargaIdx > -1) ? (cols[hargaIdx] || '').toString().trim() : '';
-
-        if (!upc) {
-          gagal++;
-          continue;
-        }
-
-        if (existingUPC.has(upc)) {
-          duplicate++;
-          continue;
-        }
-
-        // prepare record (keep keys consistent with STORE_MASTER usage)
-        buffer.push({ upc, article, deskripsi, harga });
-        existingUPC.add(upc);
-        sukses++;
-
-        // flush batch
-        if (buffer.length >= BATCH_SIZE) {
-          await saveMasterBulk(buffer.splice(0, buffer.length));
-        }
-      }
-
-      // update progress overlay (show percentage)
-      const percent = Math.min(100, Math.floor((offset / size) * 100));
-      showLoading(`Memuat... ${percent}%`);
-      // let event loop breathe a bit
-      await new Promise(r => setTimeout(r, 8));
-    }
-
-    // after loop, if carry has last line, process it
-    if (carry && carry.trim()) {
-      // if header not processed yet and carry contains header
-      if (!headerProcessed) {
-        const headerFields = parseCsvLine(carry, delimiter).map(h => (h||'').toString().toLowerCase().trim());
-        upcIdx = headerFields.findIndex(h => h.includes("upc"));
-        artIdx = headerFields.findIndex(h => h.includes("article") || h.includes("artikel"));
-        descIdx = headerFields.findIndex(h => h.includes("deskripsi") || h.includes("description") || h.includes("desc"));
-        hargaIdx = headerFields.findIndex(h => h.includes("harga") || h.includes("price") || h.includes("cost"));
-
-        if (upcIdx === -1 || artIdx === -1 || descIdx === -1) {
-          hideLoading();
-          showAlert("error", "Header wajib: UPC, Article/Artikel, Deskripsi (dan optional Harga). Pastikan header ada dan menggunakan delimiter ;");
-          $('fileMaster').value = '';
-          return;
-        }
-        headerProcessed = true;
-      } else {
-        const cols = parseCsvLine(carry, delimiter);
-        const upc = (cols[upcIdx] || '').toString().trim();
-        const article = (cols[artIdx] || '').toString().trim();
-        const deskripsi = (cols[descIdx] || '').toString().trim();
-        const harga = (hargaIdx > -1) ? (cols[hargaIdx] || '').toString().trim() : '';
-
-        if (!upc) gagal++; else {
-          if (!existingUPC.has(upc)) {
-            buffer.push({ upc, article, deskripsi, harga });
-            existingUPC.add(upc);
-            sukses++;
-          } else {
-            duplicate++;
-          }
-        }
-      }
-    }
-
-    // flush remaining buffer
-    if (buffer.length) {
-      await saveMasterBulk(buffer.splice(0, buffer.length));
-    }
-
-    showAlert(
-      "success",
-      `Import selesai!\nTotal added: ${sukses}\nDuplicate skipped: ${duplicate}\nFailed rows: ${gagal}`
-    );
-
-  } catch (err) {
-    console.error("Import error:", err);
-    showAlert("error", "Gagal memproses file master. Periksa format CSV dan coba lagi.");
-  } finally {
-    hideLoading();
-    $('fileMaster').value = "";
-  }
-}
 
 //uploadmaster asli
 async function onFileMasterSelected(e) {
@@ -1790,86 +1532,6 @@ async function onFileMasterSelected(e) {
   }
 }
 
-async function masterSelected(e) {
-  const file = e.target.files[0];
-  if (!file) return;
-
-  showLoading("Memuat file...");
-
-  const ext = file.name.split('.').pop().toLowerCase();
-
-  // ---------------------------------------------------------
-  // 1) Jika BUKAN ZIP → proses seperti biasa (CSV / XLS / XLSX)
-  // ---------------------------------------------------------
-  if (ext !== "zip") {
-    await processSingleMasterFile(file);
-    hideLoading();
-    $('fileMaster').value = "";
-    return;
-  }
-
-  // ---------------------------------------------------------
-  // 2) Jika ZIP → extract semua CSV → proses satu per satu
-  // ---------------------------------------------------------
-  try {
-    const zip = await JSZip.loadAsync(file);
-
-    // Ambil semua file csv di dalam zip
-    const csvFiles = Object.keys(zip.files).filter(name => name.toLowerCase().endsWith(".csv"));
-
-    if (csvFiles.length === 0) {
-      showAlert("error", "ZIP tidak berisi file CSV.");
-      hideLoading();
-      return;
-    }
-
-    let totalSukses = 0;
-    let totalDuplicate = 0;
-    let totalGagal = 0;
-
-    // existing UPC global (mencegah duplikasi antar file CSV)
-    const existingUPC = await getAllMasterUPC();
-
-    for (let i = 0; i < csvFiles.length; i++) {
-      const name = csvFiles[i];
-
-      showLoading(`Memuat ${name} (${i+1} / ${csvFiles.length})...`);
-
-      // extract menjadi Blob
-      const content = await zip.files[name].async("blob");
-
-      // convert blob → File
-      const csvFile = new File([content], name, { type: "text/csv" });
-
-      // proses CSV 1 file (re-use fungsi lama)
-      const result = await processSingleMasterFile(csvFile, existingUPC);
-
-      // akumulasi hasil
-      totalSukses    += result.sukses;
-      totalDuplicate += result.duplicate;
-      totalGagal     += result.gagal;
-    }
-
-    hideLoading();
-
-    showAlert(
-      "success",
-      `Import ZIP selesai!\n` +
-      `Total File CSV: ${csvFiles.length}\n\n` +
-      `Sukses: ${totalSukses}\n` +
-      `Duplicate: ${totalDuplicate}\n` +
-      `Gagal: ${totalGagal}`
-    );
-
-  } catch (err) {
-    console.error(err);
-    showAlert("error", "Gagal memproses file ZIP.");
-  }
-
-  hideLoading();
-  $('fileMaster').value = "";
-}
-
 //helper parsing csvFiles
 async function processSingleMasterFile(file, existingUPC_Global = null) {
   const rows = await parseMasterFile(file);
@@ -2023,4 +1685,39 @@ function showFocusPulse(x, y) {
     pulse.style.opacity = "0";
     pulse.style.transform = "translate(-50%, -50%) scale(1)";
   }, 300);
+}
+
+async function shareToWhatsappIOS() {
+  try {
+    const rows = await getAllOpname();
+    if (!rows.length) {
+      showAlert("error", "Tidak ada data untuk dikirim.");
+      return;
+    }
+
+    const u = await getUserInfo();
+    const tokoAsal = u?.toko_asal || "-";
+    const tokoTujuan = u?.toko_tujuan || "-";
+
+    let message = `Data TB ${tokoAsal} ke ${tokoTujuan}:\n\n`;
+
+    rows.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+    for (const r of rows) {
+      message += `${r.article || "-"} : ${r.qty ?? "-"}\n`;
+    }
+
+    const url = "https://wa.me/?text=" + encodeURIComponent(message);
+
+    // iOS WA FIX
+    window.location.href = url;
+
+    setTimeout(() => {
+      showAlert("success", "Membuka WhatsApp...");
+    }, 300);
+
+  } catch (err) {
+    console.error(err);
+    showAlert("error", "Gagal membuat pesan WhatsApp.");
+  }
 }
