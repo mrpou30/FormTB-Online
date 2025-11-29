@@ -168,6 +168,7 @@ function formatTime(d){
 //helper init
 async function init(){
   await openDB();
+  loadMasterFromZip();
   bindEvents();
   await initUserInfo();
   initHeaderTick();
@@ -1720,4 +1721,151 @@ async function shareToWhatsappIOS() {
     console.error(err);
     showAlert("error", "Gagal membuat pesan WhatsApp.");
   }
+}
+
+async function fetchMasterZip() {
+  const resp = await fetch("./master.zip"); 
+  if (!resp.ok) throw new Error("Gagal memuat master.zip: HTTP " + resp.status);
+  return await resp.arrayBuffer(); // isi ZIP
+}
+
+
+async function extractCsvFromZipBuffer(buffer) {
+  const zip = await JSZip.loadAsync(buffer);
+  const list = [];
+
+  for (const name of Object.keys(zip.files)) {
+    if (name.toLowerCase().endsWith(".csv")) {
+      const content = await zip.files[name].async("string");
+      list.push({ name, content });
+    }
+  }
+
+  return list; // [{name, content}]
+}
+
+
+async function importCsvListToMaster(csvList) {
+
+  const existingUPC = await getAllMasterUPC();
+  const CHUNK = 800;
+
+  // ringkasan total
+  let totalAll = 0;
+  let totalSukses = 0;
+  let totalDuplicate = 0;
+  let totalGagal = 0;
+
+  // proses tiap file CSV di ZIP
+  for (const file of csvList) {
+    
+    let sukses = 0;
+    let duplicate = 0;
+    let gagal = 0;
+
+    let rows;
+    try {
+      rows = parseCsv(file.content);
+    } catch (e) {
+      showAlert("error", `Gagal parse ${file.name}, dilewati.`);
+      continue;
+    }
+
+    if (!rows || rows.length < 2) {
+      showAlert("error", `${file.name}: kosong atau tidak valid.`);
+      continue;
+    }
+
+    const header = rows[0].map(h => h.toLowerCase().trim());
+    const upcIdx  = header.findIndex(h => h.includes("upc"));
+    const artIdx  = header.findIndex(h => h.includes("article") || h.includes("artikel"));
+    const descIdx = header.findIndex(h => h.includes("deskripsi") || h.includes("description"));
+
+    if (upcIdx === -1 || artIdx === -1 || descIdx === -1) {
+      showAlert("error", `${file.name}: header tidak cocok, dilewati.`);
+      continue;
+    }
+
+    const buffer = [];
+
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i];
+      const upc = (r[upcIdx] || "").trim();
+      totalAll++;
+
+      if (!upc) {
+        gagal++;
+        continue;
+      }
+
+      if (existingUPC.has(upc)) {
+        duplicate++;
+        continue;
+      }
+
+      buffer.push({
+        upc,
+        article: (r[artIdx] || "").trim(),
+        deskripsi: (r[descIdx] || "").trim(),
+      });
+
+      existingUPC.add(upc);
+
+      sukses++;
+      totalSukses++;
+
+      if (buffer.length >= CHUNK) {
+        await saveMasterBulk(buffer.splice(0));
+      }
+    }
+
+    if (buffer.length > 0) {
+      await saveMasterBulk(buffer);
+    }
+
+    totalDuplicate += duplicate;
+    totalGagal += gagal;
+
+    // 🔥 ALERT SUKSES PER FILE
+    showAlert(
+      "success",
+      `${file.name} selesai:\n` +
+      `Sukses: ${sukses}\n` +
+      `Duplicate: ${duplicate}\n` +
+      `Gagal: ${gagal}`
+    );
+  }
+
+  // 🔥 ALERT RINGKASAN TOTAL
+  showAlert(
+    "success",
+    `IMPORT SELESAI!\n\n` +
+    `Total baris: ${totalAll}\n` +
+    `Sukses: ${totalSukses}\n` +
+    `Duplicate: ${totalDuplicate}\n` +
+    `Gagal: ${totalGagal}`
+  );
+}
+
+
+async function loadMasterFromZip() {
+  showLoading();
+
+  try {
+    const buf = await fetchMasterZip();
+    const csvFiles = await extractCsvFromZipBuffer(buf);
+
+    if (!csvFiles.length) {
+      showAlert("error", "ZIP tidak berisi file CSV.");
+      return;
+    }
+
+    await importCsvListToMaster(csvFiles);
+   // showAlert("success", "Master ZIP berhasil dimuat!");
+  } catch (err) {
+    console.error(err);
+    showAlert("error", "Gagal memuat master.zip");
+  }
+
+  hideLoading();
 }
